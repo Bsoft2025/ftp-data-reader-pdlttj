@@ -1,91 +1,171 @@
-import { StyleSheet, ViewStyle, TextStyle } from 'react-native';
+
+import { StyleSheet } from 'react-native';
 
 export const colors = {
-  background: '#F5F5F5',     // Light gray for a clean look
-  text: '#212121',           // Dark gray for readability
-  textSecondary: '#757575',  // Medium gray for less important text
-  primary: '#2962FF',        // Blue for primary actions
-  secondary: '#4CAF50',      // Green for success or confirmation
-  accent: '#FFAB40',         // Orange for highlights
-  card: '#FFFFFF',           // White for cards and containers
-  highlight: '#BBDEFB',      // Light blue for selection or focus
+  // Primary colors
+  primary: '#2962FF',
+  primaryLight: '#5983FF',
+  primaryDark: '#0039CB',
+  
+  // Background colors
+  background: '#FFFFFF',
+  backgroundSecondary: '#F8F9FA',
+  card: '#FFFFFF',
+  
+  // Text colors
+  text: '#212121',
+  textSecondary: '#757575',
+  textLight: '#9E9E9E',
+  
+  // Status colors
+  success: '#4CAF50',
+  warning: '#FF9800',
+  error: '#F44336',
+  info: '#2196F3',
+  
+  // UI colors
+  highlight: '#E0E0E0',
+  border: '#E0E0E0',
+  shadow: 'rgba(0, 0, 0, 0.1)',
+  
+  // Chart colors
+  chartPrimary: '#2962FF',
+  chartSecondary: '#FF6B35',
+  chartTertiary: '#4CAF50',
+  chartQuaternary: '#FF9800',
 };
 
-export const buttonStyles = StyleSheet.create({
-  instructionsButton: {
-    backgroundColor: colors.primary,
-    alignSelf: 'center',
-    width: '100%',
+export const spacing = {
+  xs: 4,
+  sm: 8,
+  md: 16,
+  lg: 24,
+  xl: 32,
+  xxl: 48,
+};
+
+export const typography = {
+  h1: {
+    fontSize: 32,
+    fontWeight: 'bold' as const,
+    lineHeight: 40,
   },
-  backButton: {
-    backgroundColor: colors.card,
-    alignSelf: 'center',
-    width: '100%',
-    borderWidth: 1,
-    borderColor: colors.highlight,
+  h2: {
+    fontSize: 28,
+    fontWeight: 'bold' as const,
+    lineHeight: 36,
   },
-});
+  h3: {
+    fontSize: 24,
+    fontWeight: '600' as const,
+    lineHeight: 32,
+  },
+  h4: {
+    fontSize: 20,
+    fontWeight: '600' as const,
+    lineHeight: 28,
+  },
+  body: {
+    fontSize: 16,
+    fontWeight: 'normal' as const,
+    lineHeight: 24,
+  },
+  bodySmall: {
+    fontSize: 14,
+    fontWeight: 'normal' as const,
+    lineHeight: 20,
+  },
+  caption: {
+    fontSize: 12,
+    fontWeight: 'normal' as const,
+    lineHeight: 16,
+  },
+};
+
+export const shadows = {
+  small: {
+    shadowColor: colors.shadow,
+    shadowOffset: {
+      width: 0,
+      height: 1,
+    },
+    shadowOpacity: 0.22,
+    shadowRadius: 2.22,
+    elevation: 3,
+  },
+  medium: {
+    shadowColor: colors.shadow,
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  large: {
+    shadowColor: colors.shadow,
+    shadowOffset: {
+      width: 0,
+      height: 4,
+    },
+    shadowOpacity: 0.30,
+    shadowRadius: 4.65,
+    elevation: 8,
+  },
+};
+
+export const borderRadius = {
+  small: 4,
+  medium: 8,
+  large: 12,
+  xlarge: 16,
+  round: 50,
+};
 
 export const commonStyles = StyleSheet.create({
-  wrapper: {
-    backgroundColor: colors.background,
-    width: '100%',
-    height: '100%',
-  },
   container: {
     flex: 1,
     backgroundColor: colors.background,
-    width: '100%',
-    height: '100%',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  content: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    maxWidth: 800,
-    width: '100%',
-  },
-  title: {
-    fontSize: 24,
-    fontWeight: '800',
-    textAlign: 'center',
-    color: colors.text,
-    marginBottom: 10
-  },
-  text: {
-    fontSize: 16,
-    fontWeight: '500',
-    color: colors.text,
-    marginBottom: 8,
-    lineHeight: 24,
-    textAlign: 'center',
-  },
-  section: {
-    width: '100%',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-  },
-  buttonContainer: {
-    width: '100%',
-    alignItems: 'center',
-    paddingHorizontal: 20,
   },
   card: {
     backgroundColor: colors.card,
-    borderColor: colors.highlight,
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 16,
-    marginVertical: 8,
-    width: '100%',
-    boxShadow: '0px 2px 8px rgba(0, 0, 0, 0.1)',
-    elevation: 3,
+    borderRadius: borderRadius.large,
+    padding: spacing.md,
+    ...shadows.small,
   },
-  icon: {
-    width: 60,
-    height: 60,
-    tintColor: colors.primary,
+  button: {
+    backgroundColor: colors.primary,
+    borderRadius: borderRadius.medium,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  buttonText: {
+    color: colors.card,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.medium,
+    padding: spacing.sm,
+    fontSize: 16,
+    color: colors.text,
+    backgroundColor: colors.background,
+  },
+  errorText: {
+    color: colors.error,
+    fontSize: 14,
+  },
+  successText: {
+    color: colors.success,
+    fontSize: 14,
+  },
+  warningText: {
+    color: colors.warning,
+    fontSize: 14,
   },
 });
