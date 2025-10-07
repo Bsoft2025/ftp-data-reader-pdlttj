@@ -1,11 +1,12 @@
+
 import "react-native-reanimated";
 import React, { useEffect } from "react";
 import { useFonts } from "expo-font";
-import { Stack, router } from "expo-router";
+import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { SystemBars } from "react-native-edge-to-edge";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
-import { useColorScheme, Alert } from "react-native";
+import { useColorScheme, Alert, AppState } from "react-native";
 import { useNetworkState } from "expo-network";
 import {
   DarkTheme,
@@ -14,8 +15,11 @@ import {
   ThemeProvider,
 } from "@react-navigation/native";
 import { StatusBar } from "expo-status-bar";
-import { Button } from "@/components/button";
 import { WidgetProvider } from "@/contexts/WidgetContext";
+import { logger, setupGlobalErrorHandling } from "@/services/Logger";
+import { cleanupFTPService } from "@/services/FTPService";
+import ErrorBoundary from "@/components/ErrorBoundary";
+import { getEnvironment } from "@/config/environment";
 
 // Prevent the splash screen from auto-hiding before asset loading is complete.
 SplashScreen.preventAutoHideAsync();
@@ -32,20 +36,65 @@ export default function RootLayout() {
   });
 
   useEffect(() => {
+    // Initialize production-ready logging and error handling
+    setupGlobalErrorHandling();
+    
+    const environment = getEnvironment();
+    logger.info('App started', {
+      version: environment.version,
+      buildNumber: environment.buildNumber,
+      isDevelopment: environment.isDevelopment,
+      platform: process.env.EXPO_OS,
+    }, 'RootLayout');
+
     if (loaded) {
       SplashScreen.hideAsync();
+      logger.info('Splash screen hidden, fonts loaded', {}, 'RootLayout');
     }
   }, [loaded]);
 
-  React.useEffect(() => {
-    if (
-      !networkState.isConnected &&
-      networkState.isInternetReachable === false
-    ) {
+  // Handle app state changes for cleanup
+  useEffect(() => {
+    const handleAppStateChange = (nextAppState: string) => {
+      logger.info('App state changed', { state: nextAppState }, 'RootLayout');
+      
+      if (nextAppState === 'background' || nextAppState === 'inactive') {
+        // Cleanup resources when app goes to background
+        cleanupFTPService().catch(error => {
+          logger.error('Error during background cleanup', { error }, 'RootLayout');
+        });
+      }
+    };
+
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    
+    return () => {
+      subscription?.remove();
+      // Final cleanup when component unmounts
+      cleanupFTPService().catch(error => {
+        logger.error('Error during component unmount cleanup', { error }, 'RootLayout');
+      });
+      logger.destroy();
+    };
+  }, []);
+
+  // Enhanced network state monitoring
+  useEffect(() => {
+    if (networkState.isConnected === false) {
+      logger.warn('Network disconnected', { 
+        isInternetReachable: networkState.isInternetReachable 
+      }, 'RootLayout');
+      
       Alert.alert(
         "🔌 You are offline",
-        "You can keep using the app! Your changes will be saved locally and synced when you are back online."
+        "You can keep using the app! Your changes will be saved locally and synced when you are back online.",
+        [{ text: "OK", style: "default" }]
       );
+    } else if (networkState.isConnected === true) {
+      logger.info('Network connected', { 
+        isInternetReachable: networkState.isInternetReachable,
+        type: networkState.type 
+      }, 'RootLayout');
     }
   }, [networkState.isConnected, networkState.isInternetReachable]);
 
@@ -57,34 +106,35 @@ export default function RootLayout() {
     ...DefaultTheme,
     dark: false,
     colors: {
-      primary: "rgb(0, 122, 255)", // System Blue
-      background: "rgb(242, 242, 247)", // Light mode background
-      card: "rgb(255, 255, 255)", // White cards/surfaces
-      text: "rgb(0, 0, 0)", // Black text for light mode
-      border: "rgb(216, 216, 220)", // Light gray for separators/borders
-      notification: "rgb(255, 59, 48)", // System Red
+      primary: "rgb(41, 98, 255)", // Updated to match commonStyles
+      background: "rgb(255, 255, 255)",
+      card: "rgb(255, 255, 255)",
+      text: "rgb(33, 33, 33)",
+      border: "rgb(224, 224, 224)",
+      notification: "rgb(244, 67, 54)",
     },
   };
 
   const CustomDarkTheme: Theme = {
     ...DarkTheme,
     colors: {
-      primary: "rgb(10, 132, 255)", // System Blue (Dark Mode)
-      background: "rgb(1, 1, 1)", // True black background for OLED displays
-      card: "rgb(28, 28, 30)", // Dark card/surface color
-      text: "rgb(255, 255, 255)", // White text for dark mode
-      border: "rgb(44, 44, 46)", // Dark gray for separators/borders
-      notification: "rgb(255, 69, 58)", // System Red (Dark Mode)
+      primary: "rgb(89, 131, 255)",
+      background: "rgb(18, 18, 18)",
+      card: "rgb(28, 28, 30)",
+      text: "rgb(255, 255, 255)",
+      border: "rgb(68, 68, 70)",
+      notification: "rgb(255, 69, 58)",
     },
   };
+
   return (
-    <>
+    <ErrorBoundary>
       <StatusBar style="auto" animated />
-        <ThemeProvider
-          value={colorScheme === "dark" ? CustomDarkTheme : CustomDefaultTheme}
-        >
-          <WidgetProvider>
-            <GestureHandlerRootView>
+      <ThemeProvider
+        value={colorScheme === "dark" ? CustomDarkTheme : CustomDefaultTheme}
+      >
+        <WidgetProvider>
+          <GestureHandlerRootView style={{ flex: 1 }}>
             <Stack>
               {/* Main app with tabs */}
               <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
@@ -115,10 +165,10 @@ export default function RootLayout() {
                 }}
               />
             </Stack>
-            <SystemBars style={"auto"} />
-            </GestureHandlerRootView>
-          </WidgetProvider>
-        </ThemeProvider>
-    </>
+            <SystemBars style="auto" />
+          </GestureHandlerRootView>
+        </WidgetProvider>
+      </ThemeProvider>
+    </ErrorBoundary>
   );
 }

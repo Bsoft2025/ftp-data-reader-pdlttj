@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
   ScrollView,
   Pressable,
   Dimensions,
+  RefreshControl,
 } from 'react-native';
 import { LineChart, BarChart, PieChart } from 'react-native-chart-kit';
 import * as XLSX from 'xlsx';
@@ -16,7 +17,11 @@ import * as FileSystem from 'expo-file-system';
 import { colors } from '@/styles/commonStyles';
 import { IconSymbol } from './IconSymbol';
 import { getFTPService, FTPConfig } from '@/services/FTPService';
+import { logger } from '@/services/Logger';
+import { performanceMonitor } from '@/services/PerformanceMonitor';
+import { config } from '@/config/environment';
 import LoadingScreen from './LoadingScreen';
+import ErrorBoundary from './ErrorBoundary';
 
 interface DataPoint {
   name: string;
@@ -54,6 +59,7 @@ const chartConfig = {
 
 export default function DataDisplay() {
   const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [data, setData] = useState<any[]>([]);
   const [chartData, setChartData] = useState<ChartData | null>(null);
   const [pieData, setPieData] = useState<DataPoint[]>([]);
@@ -62,199 +68,294 @@ export default function DataDisplay() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [connectionStatus, setConnectionStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [refreshInterval, setRefreshInterval] = useState<NodeJS.Timeout | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
   const [ftpConfig, setFtpConfig] = useState<FTPConfig>({
-    host: 'ftp.example.com',
-    port: '21',
-    username: 'user',
-    password: 'password',
+    host: config.ftp.defaultHost,
+    port: config.ftp.defaultPort,
+    username: '',
+    password: '',
     filename: 'data.xls',
   });
 
-  // Test FTP connection
-  const testFTPConnection = async (): Promise<boolean> => {
+  // Memoized chart configuration to prevent unnecessary re-renders
+  const memoizedChartConfig = useMemo(() => chartConfig, []);
+
+  // Load FTP configuration on component mount
+  useEffect(() => {
+    loadFTPConfiguration();
+    performanceMonitor.logStartupMetrics();
+  }, []);
+
+  // Auto-refresh effect
+  useEffect(() => {
+    if (autoRefresh && !isLoading && !isRefreshing) {
+      const interval = setInterval(() => {
+        logger.debug('Auto-refresh triggered', {}, 'DataDisplay');
+        fetchAndProcessData(false);
+      }, config.app.refreshInterval);
+      
+      setRefreshInterval(interval);
+      
+      return () => {
+        if (interval) {
+          clearInterval(interval);
+        }
+      };
+    } else if (refreshInterval) {
+      clearInterval(refreshInterval);
+      setRefreshInterval(null);
+    }
+  }, [autoRefresh, isLoading, isRefreshing]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (refreshInterval) {
+        clearInterval(refreshInterval);
+      }
+    };
+  }, [refreshInterval]);
+
+  const loadFTPConfiguration = async () => {
     try {
-      setConnectionStatus('connecting');
-      setErrorMessage(null);
+      logger.info('Loading FTP configuration', {}, 'DataDisplay');
+      const ftpService = getFTPService();
+      const savedConfig = await ftpService.loadCredentials();
       
-      const ftpService = getFTPService(ftpConfig);
-      const isConnected = await ftpService.testConnection();
-      
-      if (isConnected) {
-        setConnectionStatus('connected');
-        console.log('FTP connection test successful');
-        return true;
+      if (savedConfig) {
+        setFtpConfig(savedConfig);
+        logger.info('FTP configuration loaded', { host: savedConfig.host }, 'DataDisplay');
+        // Auto-fetch data if we have saved configuration
+        fetchAndProcessData(true);
       } else {
+        logger.info('No saved FTP configuration found', {}, 'DataDisplay');
+        // Still try to fetch with default config (will use mock data)
+        fetchAndProcessData(true);
+      }
+    } catch (error) {
+      logger.error('Failed to load FTP configuration', { 
+        error: error instanceof Error ? error.message : error 
+      }, 'DataDisplay');
+    }
+  };
+
+  const testFTPConnection = useCallback(async (): Promise<boolean> => {
+    return performanceMonitor.measureAsync('ftp_connection_test', async () => {
+      try {
+        setConnectionStatus('connecting');
+        setErrorMessage(null);
+        
+        const ftpService = getFTPService(ftpConfig);
+        const isConnected = await ftpService.testConnection();
+        
+        if (isConnected) {
+          setConnectionStatus('connected');
+          setRetryCount(0);
+          logger.info('FTP connection test successful', { host: ftpConfig.host }, 'DataDisplay');
+          return true;
+        } else {
+          setConnectionStatus('error');
+          setErrorMessage('Failed to connect to FTP server');
+          return false;
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Connection test failed';
+        logger.error('FTP connection test failed', { error: errorMsg, host: ftpConfig.host }, 'DataDisplay');
         setConnectionStatus('error');
-        setErrorMessage('Failed to connect to FTP server');
+        setErrorMessage(errorMsg);
         return false;
       }
-    } catch (error) {
-      console.error('FTP connection test error:', error);
-      setConnectionStatus('error');
-      setErrorMessage(error instanceof Error ? error.message : 'Connection test failed');
-      return false;
-    }
-  };
+    }, { host: ftpConfig.host });
+  }, [ftpConfig]);
 
-  // Download XLS file using FTP service
-  const downloadXLSFile = async (): Promise<string | null> => {
-    try {
-      console.log('Attempting to download file from FTP server...');
-      setErrorMessage(null);
-      
-      const ftpService = getFTPService(ftpConfig);
-      const fileUri = await ftpService.downloadFile();
-      
-      if (fileUri) {
-        console.log('XLS file downloaded successfully to:', fileUri);
-        return fileUri;
-      } else {
-        throw new Error('Failed to download file - no file URI returned');
-      }
-    } catch (error) {
-      console.error('Error downloading XLS file:', error);
-      const errorMsg = error instanceof Error ? error.message : 'Unknown download error';
-      setErrorMessage(`Download failed: ${errorMsg}`);
-      
-      // Don't show alert here as we'll show it in the UI
-      return null;
-    }
-  };
-
-  const parseXLSFile = async (fileUri: string) => {
-    try {
-      console.log('Parsing XLS file from:', fileUri);
-      
-      // Check if file exists
-      const fileInfo = await FileSystem.getInfoAsync(fileUri);
-      if (!fileInfo.exists) {
-        throw new Error('Downloaded file does not exist');
-      }
-
-      // Read the file
-      const fileContent = await FileSystem.readAsStringAsync(fileUri, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-
-      if (!fileContent) {
-        throw new Error('File content is empty');
-      }
-
-      // Try to parse as Excel first
+  const downloadXLSFile = useCallback(async (): Promise<string | null> => {
+    return performanceMonitor.measureAsync('ftp_file_download', async () => {
       try {
-        const workbook = XLSX.read(fileContent, { type: 'base64' });
-        const sheetName = workbook.SheetNames[0];
+        logger.info('Starting file download', { filename: ftpConfig.filename }, 'DataDisplay');
+        setErrorMessage(null);
         
-        if (!sheetName) {
-          throw new Error('No sheets found in Excel file');
+        const ftpService = getFTPService(ftpConfig);
+        const fileUri = await ftpService.downloadFile();
+        
+        if (fileUri) {
+          logger.info('File downloaded successfully', { path: fileUri }, 'DataDisplay');
+          return fileUri;
+        } else {
+          throw new Error('Failed to download file - no file URI returned');
         }
-        
-        const worksheet = workbook.Sheets[sheetName];
-        const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-        
-        console.log('Excel file parsed successfully, rows:', jsonData.length);
-        return jsonData;
-      } catch (xlsxError) {
-        console.log('Excel parsing failed, trying CSV parsing...', xlsxError);
-        
-        // If Excel parsing fails, try CSV parsing
-        const csvContent = Buffer.from(fileContent, 'base64').toString('utf-8');
-        const rows = csvContent.split('\n')
-          .filter(row => row.trim().length > 0) // Remove empty rows
-          .map(row => row.split(',').map(cell => cell.trim()));
-        
-        console.log('CSV file parsed successfully, rows:', rows.length);
-        return rows;
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown download error';
+        logger.error('File download failed', { error: errorMsg, filename: ftpConfig.filename }, 'DataDisplay');
+        setErrorMessage(`Download failed: ${errorMsg}`);
+        return null;
       }
-    } catch (error) {
-      console.error('Error parsing file:', error);
-      const errorMsg = error instanceof Error ? error.message : 'Unknown parsing error';
-      setErrorMessage(`File parsing failed: ${errorMsg}`);
-      throw error;
-    }
-  };
+    }, { filename: ftpConfig.filename });
+  }, [ftpConfig]);
 
-  const processDataForCharts = (rawData: any[]) => {
-    try {
-      if (!rawData || rawData.length < 2) {
-        throw new Error('Insufficient data - need at least 2 rows (header + data)');
-      }
+  const parseXLSFile = useCallback(async (fileUri: string) => {
+    return performanceMonitor.measureAsync('file_parsing', async () => {
+      try {
+        logger.info('Parsing file', { path: fileUri }, 'DataDisplay');
+        
+        // Check if file exists and get info
+        const fileInfo = await FileSystem.getInfoAsync(fileUri);
+        if (!fileInfo.exists) {
+          throw new Error('Downloaded file does not exist');
+        }
 
-      // Assume first row is headers, rest is data
-      const headers = rawData[0] as string[];
-      const dataRows = rawData.slice(1).filter(row => row && row.length > 0);
+        if (fileInfo.size === 0) {
+          throw new Error('Downloaded file is empty');
+        }
 
-      if (dataRows.length === 0) {
-        throw new Error('No data rows found');
-      }
+        if (fileInfo.size > config.app.maxFileSize) {
+          throw new Error(`File size (${fileInfo.size}) exceeds maximum allowed size (${config.app.maxFileSize})`);
+        }
 
-      console.log('Processing data for charts:', { 
-        headers: headers.length, 
-        dataRows: dataRows.length 
-      });
-
-      // Create chart data for line/bar charts
-      const labels = dataRows.map((row, index) => {
-        const label = String(row[0] || `Row ${index + 1}`);
-        return label.length > 10 ? label.substring(0, 10) + '...' : label;
-      });
-      
-      const datasets = [];
-
-      // Process numeric columns (skip first column which is labels)
-      for (let i = 1; i < headers.length && i < 5; i++) { // Limit to 4 datasets for readability
-        const columnData = dataRows.map(row => {
-          const value = row[i];
-          const numValue = Number(value);
-          return isNaN(numValue) ? 0 : numValue;
+        // Read the file
+        const fileContent = await FileSystem.readAsStringAsync(fileUri, {
+          encoding: FileSystem.EncodingType.Base64,
         });
 
-        // Only add dataset if it has some non-zero values
-        if (columnData.some(val => val !== 0)) {
-          datasets.push({
-            data: columnData,
-            color: (opacity: number) => `rgba(${41 + i * 50}, ${98 + i * 30}, 255, ${opacity})`,
-            strokeWidth: 2,
-          });
+        if (!fileContent) {
+          throw new Error('File content is empty');
         }
+
+        // Try to parse as Excel first
+        try {
+          const workbook = XLSX.read(fileContent, { type: 'base64' });
+          const sheetName = workbook.SheetNames[0];
+          
+          if (!sheetName) {
+            throw new Error('No sheets found in Excel file');
+          }
+          
+          const worksheet = workbook.Sheets[sheetName];
+          const jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
+          
+          logger.info('Excel file parsed successfully', { 
+            rows: jsonData.length,
+            fileSize: fileInfo.size 
+          }, 'DataDisplay');
+          return jsonData;
+        } catch (xlsxError) {
+          logger.info('Excel parsing failed, trying CSV parsing', { error: xlsxError }, 'DataDisplay');
+          
+          // If Excel parsing fails, try CSV parsing
+          const csvContent = Buffer.from(fileContent, 'base64').toString('utf-8');
+          const rows = csvContent.split('\n')
+            .filter(row => row.trim().length > 0) // Remove empty rows
+            .map(row => row.split(',').map(cell => cell.trim()));
+          
+          logger.info('CSV file parsed successfully', { 
+            rows: rows.length,
+            fileSize: fileInfo.size 
+          }, 'DataDisplay');
+          return rows;
+        }
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown parsing error';
+        logger.error('File parsing failed', { error: errorMsg, path: fileUri }, 'DataDisplay');
+        setErrorMessage(`File parsing failed: ${errorMsg}`);
+        throw error;
       }
+    }, { fileUri });
+  }, []);
 
-      if (datasets.length === 0) {
-        throw new Error('No numeric data columns found');
+  const processDataForCharts = useCallback((rawData: any[]) => {
+    return performanceMonitor.measureSync('data_processing', () => {
+      try {
+        if (!rawData || rawData.length < 2) {
+          throw new Error('Insufficient data - need at least 2 rows (header + data)');
+        }
+
+        // Assume first row is headers, rest is data
+        const headers = rawData[0] as string[];
+        const dataRows = rawData.slice(1).filter(row => row && row.length > 0);
+
+        if (dataRows.length === 0) {
+          throw new Error('No data rows found');
+        }
+
+        logger.info('Processing data for charts', { 
+          headers: headers.length, 
+          dataRows: dataRows.length 
+        }, 'DataDisplay');
+
+        // Create chart data for line/bar charts
+        const labels = dataRows.map((row, index) => {
+          const label = String(row[0] || `Row ${index + 1}`);
+          return label.length > 10 ? label.substring(0, 10) + '...' : label;
+        });
+        
+        const datasets = [];
+
+        // Process numeric columns (skip first column which is labels)
+        for (let i = 1; i < headers.length && i < 5; i++) { // Limit to 4 datasets for readability
+          const columnData = dataRows.map(row => {
+            const value = row[i];
+            const numValue = Number(value);
+            return isNaN(numValue) ? 0 : numValue;
+          });
+
+          // Only add dataset if it has some non-zero values
+          if (columnData.some(val => val !== 0)) {
+            datasets.push({
+              data: columnData,
+              color: (opacity: number) => `rgba(${41 + i * 50}, ${98 + i * 30}, 255, ${opacity})`,
+              strokeWidth: 2,
+            });
+          }
+        }
+
+        if (datasets.length === 0) {
+          throw new Error('No numeric data columns found');
+        }
+
+        const processedChartData: ChartData = { labels, datasets };
+        setChartData(processedChartData);
+
+        // Create pie chart data (using first numeric column)
+        const pieChartData: DataPoint[] = labels.map((label, index) => ({
+          name: label,
+          value: Math.abs(datasets[0].data[index]) || 1, // Ensure positive values for pie chart
+          color: `hsl(${(index * 360) / labels.length}, 70%, 50%)`,
+        }));
+        setPieData(pieChartData);
+
+        setData(dataRows);
+        logger.info('Data processed successfully for charts', { 
+          chartDatasets: datasets.length,
+          pieDataPoints: pieChartData.length 
+        }, 'DataDisplay');
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown processing error';
+        logger.error('Data processing failed', { error: errorMsg }, 'DataDisplay');
+        setErrorMessage(`Data processing failed: ${errorMsg}`);
+        throw error;
       }
+    }, { dataRows: rawData.length });
+  }, []);
 
-      const processedChartData: ChartData = { labels, datasets };
-      setChartData(processedChartData);
-
-      // Create pie chart data (using first numeric column)
-      const pieChartData: DataPoint[] = labels.map((label, index) => ({
-        name: label,
-        value: Math.abs(datasets[0].data[index]) || 1, // Ensure positive values for pie chart
-        color: `hsl(${(index * 360) / labels.length}, 70%, 50%)`,
-      }));
-      setPieData(pieChartData);
-
-      setData(dataRows);
-      console.log('Data processed successfully for charts');
-    } catch (error) {
-      console.error('Error processing data for charts:', error);
-      const errorMsg = error instanceof Error ? error.message : 'Unknown processing error';
-      setErrorMessage(`Data processing failed: ${errorMsg}`);
-      throw error;
-    }
-  };
-
-  const fetchAndProcessData = async () => {
-    setIsLoading(true);
+  const fetchAndProcessData = useCallback(async (isInitialLoad: boolean = false) => {
+    const loadingStateSetter = isInitialLoad ? setIsLoading : setIsRefreshing;
+    
+    loadingStateSetter(true);
     setErrorMessage(null);
     
     try {
-      // Test connection first
-      console.log('Testing FTP connection before download...');
+      performanceMonitor.startTiming('full_data_fetch', { 
+        isInitialLoad,
+        retryCount,
+        host: ftpConfig.host 
+      });
+
+      // Test connection first (but don't fail if it doesn't work)
+      logger.info('Testing FTP connection before download', {}, 'DataDisplay');
       const connectionOk = await testFTPConnection();
       
       if (!connectionOk) {
-        console.log('Connection test failed, but continuing with download attempt...');
+        logger.warn('Connection test failed, but continuing with download attempt', {}, 'DataDisplay');
       }
 
       // Download XLS file from FTP
@@ -274,56 +375,62 @@ export default function DataDisplay() {
 
       setLastUpdated(new Date());
       setConnectionStatus('connected');
-      console.log('Data loaded and processed successfully!');
+      setRetryCount(0);
+      
+      performanceMonitor.endTiming('full_data_fetch', { 
+        success: true,
+        dataRows: parsedData.length 
+      });
+      
+      logger.info('Data loaded and processed successfully', { 
+        rows: parsedData.length,
+        retryCount 
+      }, 'DataDisplay');
       
       // Clean up downloaded file to save space
       try {
         await FileSystem.deleteAsync(fileUri);
-        console.log('Temporary file cleaned up');
+        logger.debug('Temporary file cleaned up', { path: fileUri }, 'DataDisplay');
       } catch (cleanupError) {
-        console.warn('Failed to clean up temporary file:', cleanupError);
+        logger.warn('Failed to clean up temporary file', { 
+          error: cleanupError,
+          path: fileUri 
+        }, 'DataDisplay');
       }
       
     } catch (error) {
-      console.error('Error in fetchAndProcessData:', error);
-      setConnectionStatus('error');
       const errorMsg = error instanceof Error ? error.message : 'Unknown error occurred';
-      setErrorMessage(errorMsg);
+      logger.error('Data fetch and processing failed', { 
+        error: errorMsg,
+        retryCount,
+        isInitialLoad 
+      }, 'DataDisplay');
       
-      // Show alert for critical errors
-      Alert.alert('Error', `Failed to fetch and process data: ${errorMsg}`);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    // Auto-fetch data on component mount
-    console.log('Component mounted, fetching initial data...');
-    fetchAndProcessData();
-  }, []);
-
-  useEffect(() => {
-    // Set up auto-refresh interval
-    let interval: NodeJS.Timeout | null = null;
-    
-    if (autoRefresh && !isLoading) {
-      console.log('Setting up auto-refresh interval (30 seconds)');
-      interval = setInterval(() => {
-        console.log('Auto-refreshing data...');
-        fetchAndProcessData();
-      }, 30000); // Refresh every 30 seconds
-    }
-
-    return () => {
-      if (interval) {
-        clearInterval(interval);
-        console.log('Auto-refresh interval cleared');
+      setConnectionStatus('error');
+      setErrorMessage(errorMsg);
+      setRetryCount(prev => prev + 1);
+      
+      performanceMonitor.endTiming('full_data_fetch', { 
+        success: false,
+        error: errorMsg 
+      });
+      
+      // Show alert only for initial loads or after multiple retries
+      if (isInitialLoad || retryCount >= 3) {
+        Alert.alert('Error', `Failed to fetch and process data: ${errorMsg}`);
       }
-    };
-  }, [autoRefresh, isLoading]);
+    } finally {
+      loadingStateSetter(false);
+      performanceMonitor.logMemoryUsage('after_data_fetch');
+    }
+  }, [ftpConfig, retryCount, testFTPConnection, downloadXLSFile, parseXLSFile, processDataForCharts]);
 
-  const renderChart = () => {
+  const handleRefresh = useCallback(() => {
+    logger.info('Manual refresh triggered', {}, 'DataDisplay');
+    fetchAndProcessData(false);
+  }, [fetchAndProcessData]);
+
+  const renderChart = useCallback(() => {
     if (!chartData) return null;
 
     const chartWidth = screenWidth - 32;
@@ -336,7 +443,7 @@ export default function DataDisplay() {
               data={chartData}
               width={chartWidth}
               height={220}
-              chartConfig={chartConfig}
+              chartConfig={memoizedChartConfig}
               bezier
               style={styles.chart}
             />
@@ -347,7 +454,7 @@ export default function DataDisplay() {
               data={chartData}
               width={chartWidth}
               height={220}
-              chartConfig={chartConfig}
+              chartConfig={memoizedChartConfig}
               style={styles.chart}
             />
           );
@@ -357,7 +464,7 @@ export default function DataDisplay() {
               data={pieData}
               width={chartWidth}
               height={220}
-              chartConfig={chartConfig}
+              chartConfig={memoizedChartConfig}
               accessor="value"
               backgroundColor="transparent"
               paddingLeft="15"
@@ -368,7 +475,10 @@ export default function DataDisplay() {
           return null;
       }
     } catch (chartError) {
-      console.error('Error rendering chart:', chartError);
+      logger.error('Chart rendering error', { 
+        error: chartError,
+        chartType 
+      }, 'DataDisplay');
       return (
         <View style={styles.chartError}>
           <IconSymbol name="exclamationmark.triangle" color={colors.textSecondary} size={24} />
@@ -376,9 +486,9 @@ export default function DataDisplay() {
         </View>
       );
     }
-  };
+  }, [chartData, chartType, pieData, memoizedChartConfig]);
 
-  const renderChartTypeSelector = () => (
+  const renderChartTypeSelector = useCallback(() => (
     <View style={styles.chartTypeSelector}>
       {(['line', 'bar', 'pie'] as const).map((type) => (
         <Pressable
@@ -387,7 +497,10 @@ export default function DataDisplay() {
             styles.chartTypeButton,
             chartType === type && styles.chartTypeButtonActive,
           ]}
-          onPress={() => setChartType(type)}
+          onPress={() => {
+            logger.debug('Chart type changed', { from: chartType, to: type }, 'DataDisplay');
+            setChartType(type);
+          }}
         >
           <Text
             style={[
@@ -400,134 +513,158 @@ export default function DataDisplay() {
         </Pressable>
       ))}
     </View>
-  );
+  ), [chartType]);
 
-  const getStatusColor = () => {
+  const getStatusColor = useCallback(() => {
     switch (connectionStatus) {
       case 'connected': return colors.success || '#4CAF50';
       case 'connecting': return colors.warning || '#FF9800';
       case 'error': return colors.error || '#F44336';
       default: return colors.textSecondary;
     }
-  };
+  }, [connectionStatus]);
 
-  const getStatusText = () => {
+  const getStatusText = useCallback(() => {
     switch (connectionStatus) {
       case 'connected': return 'Connected';
       case 'connecting': return 'Connecting...';
       case 'error': return 'Connection Error';
       default: return 'Disconnected';
     }
-  };
+  }, [connectionStatus]);
 
   if (isLoading && !chartData) {
     return <LoadingScreen message="Connecting to FTP server and downloading data..." />;
   }
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.contentContainer}>
-      <View style={styles.header}>
-        <Text style={styles.title}>XLS Data Visualization</Text>
-        <Text style={styles.subtitle}>
-          Real-time data from FTP server using react-native-ftp
-        </Text>
-      </View>
-
-      <View style={styles.configCard}>
-        <Text style={styles.configTitle}>FTP Connection Status</Text>
-        <View style={styles.statusRow}>
-          <View style={[styles.statusIndicator, { backgroundColor: getStatusColor() }]} />
-          <Text style={[styles.statusText, { color: getStatusColor() }]}>
-            {getStatusText()}
+    <ErrorBoundary>
+      <ScrollView 
+        style={styles.container} 
+        contentContainerStyle={styles.contentContainer}
+        refreshControl={
+          <RefreshControl
+            refreshing={isRefreshing}
+            onRefresh={handleRefresh}
+            colors={[colors.primary]}
+            tintColor={colors.primary}
+          />
+        }
+      >
+        <View style={styles.header}>
+          <Text style={styles.title}>FTP Data Visualizer</Text>
+          <Text style={styles.subtitle}>
+            Production-ready data visualization with secure FTP integration
           </Text>
         </View>
-        <Text style={styles.configText}>Host: {ftpConfig.host}:{ftpConfig.port}</Text>
-        <Text style={styles.configText}>User: {ftpConfig.username}</Text>
-        <Text style={styles.configText}>File: {ftpConfig.filename}</Text>
-        {lastUpdated && (
-          <Text style={styles.configText}>
-            Last Updated: {lastUpdated.toLocaleTimeString()}
-          </Text>
-        )}
-        {errorMessage && (
-          <View style={styles.errorContainer}>
-            <IconSymbol name="exclamationmark.triangle" color={colors.error || '#F44336'} size={16} />
-            <Text style={styles.errorText}>{errorMessage}</Text>
+
+        <View style={styles.configCard}>
+          <Text style={styles.configTitle}>Connection Status</Text>
+          <View style={styles.statusRow}>
+            <View style={[styles.statusIndicator, { backgroundColor: getStatusColor() }]} />
+            <Text style={[styles.statusText, { color: getStatusColor() }]}>
+              {getStatusText()}
+            </Text>
+            {retryCount > 0 && (
+              <Text style={styles.retryText}>
+                (Retry {retryCount})
+              </Text>
+            )}
           </View>
-        )}
-        <View style={styles.autoRefreshContainer}>
-          <Text style={styles.configText}>Auto-refresh (30s): </Text>
-          <Pressable
-            style={[styles.toggleSwitch, autoRefresh && styles.toggleSwitchActive]}
-            onPress={() => setAutoRefresh(!autoRefresh)}
-          >
-            <View style={[
-              styles.toggleThumb,
-              autoRefresh && styles.toggleThumbActive
-            ]} />
-          </Pressable>
-        </View>
-      </View>
-
-      <View style={styles.buttonRow}>
-        <Pressable
-          style={[styles.actionButton, styles.testButton]}
-          onPress={testFTPConnection}
-          disabled={isLoading}
-        >
-          {connectionStatus === 'connecting' ? (
-            <ActivityIndicator color={colors.card} size="small" />
-          ) : (
-            <IconSymbol name="network" color={colors.card} size={20} />
-          )}
-          <Text style={styles.actionButtonText}>Test Connection</Text>
-        </Pressable>
-
-        <Pressable
-          style={[styles.actionButton, styles.refreshButton, isLoading && styles.refreshButtonDisabled]}
-          onPress={fetchAndProcessData}
-          disabled={isLoading}
-        >
-          {isLoading ? (
-            <ActivityIndicator color={colors.card} size="small" />
-          ) : (
-            <IconSymbol name="arrow.clockwise" color={colors.card} size={20} />
-          )}
-          <Text style={styles.actionButtonText}>
-            {isLoading ? 'Loading...' : 'Refresh Data'}
-          </Text>
-        </Pressable>
-      </View>
-
-      {chartData && (
-        <>
-          {renderChartTypeSelector()}
-          <View style={styles.chartContainer}>
-            {renderChart()}
-          </View>
-        </>
-      )}
-
-      {data.length > 0 && (
-        <View style={styles.dataPreview}>
-          <Text style={styles.dataPreviewTitle}>Data Preview ({data.length} rows)</Text>
-          {data.slice(0, 5).map((row, index) => (
-            <View key={index} style={styles.dataRow}>
-              {row.slice(0, 4).map((cell: any, cellIndex: number) => (
-                <Text key={cellIndex} style={styles.dataCell} numberOfLines={1}>
-                  {String(cell || '')}
-                </Text>
-              ))}
-            </View>
-          ))}
-          {data.length > 5 && (
-            <Text style={styles.moreDataText}>
-              ... and {data.length - 5} more rows
+          <Text style={styles.configText}>Host: {ftpConfig.host}:{ftpConfig.port}</Text>
+          <Text style={styles.configText}>User: {ftpConfig.username || 'Not configured'}</Text>
+          <Text style={styles.configText}>File: {ftpConfig.filename}</Text>
+          {lastUpdated && (
+            <Text style={styles.configText}>
+              Last Updated: {lastUpdated.toLocaleTimeString()}
             </Text>
           )}
+          {errorMessage && (
+            <View style={styles.errorContainer}>
+              <IconSymbol name="exclamationmark.triangle" color={colors.error || '#F44336'} size={16} />
+              <Text style={styles.errorText}>{errorMessage}</Text>
+            </View>
+          )}
+          <View style={styles.autoRefreshContainer}>
+            <Text style={styles.configText}>
+              Auto-refresh ({Math.round(config.app.refreshInterval / 1000)}s): 
+            </Text>
+            <Pressable
+              style={[styles.toggleSwitch, autoRefresh && styles.toggleSwitchActive]}
+              onPress={() => {
+                const newValue = !autoRefresh;
+                setAutoRefresh(newValue);
+                logger.info('Auto-refresh toggled', { enabled: newValue }, 'DataDisplay');
+              }}
+            >
+              <View style={[
+                styles.toggleThumb,
+                autoRefresh && styles.toggleThumbActive
+              ]} />
+            </Pressable>
+          </View>
         </View>
-      )}
-    </ScrollView>
+
+        <View style={styles.buttonRow}>
+          <Pressable
+            style={[styles.actionButton, styles.testButton]}
+            onPress={testFTPConnection}
+            disabled={isLoading || isRefreshing}
+          >
+            {connectionStatus === 'connecting' ? (
+              <ActivityIndicator color={colors.card} size="small" />
+            ) : (
+              <IconSymbol name="network" color={colors.card} size={20} />
+            )}
+            <Text style={styles.actionButtonText}>Test Connection</Text>
+          </Pressable>
+
+          <Pressable
+            style={[styles.actionButton, styles.refreshButton, (isLoading || isRefreshing) && styles.refreshButtonDisabled]}
+            onPress={handleRefresh}
+            disabled={isLoading || isRefreshing}
+          >
+            {isLoading || isRefreshing ? (
+              <ActivityIndicator color={colors.card} size="small" />
+            ) : (
+              <IconSymbol name="arrow.clockwise" color={colors.card} size={20} />
+            )}
+            <Text style={styles.actionButtonText}>
+              {isLoading || isRefreshing ? 'Loading...' : 'Refresh Data'}
+            </Text>
+          </Pressable>
+        </View>
+
+        {chartData && (
+          <>
+            {renderChartTypeSelector()}
+            <View style={styles.chartContainer}>
+              {renderChart()}
+            </View>
+          </>
+        )}
+
+        {data.length > 0 && (
+          <View style={styles.dataPreview}>
+            <Text style={styles.dataPreviewTitle}>Data Preview ({data.length} rows)</Text>
+            {data.slice(0, 5).map((row, index) => (
+              <View key={index} style={styles.dataRow}>
+                {row.slice(0, 4).map((cell: any, cellIndex: number) => (
+                  <Text key={cellIndex} style={styles.dataCell} numberOfLines={1}>
+                    {String(cell || '')}
+                  </Text>
+                ))}
+              </View>
+            ))}
+            {data.length > 5 && (
+              <Text style={styles.moreDataText}>
+                ... and {data.length - 5} more rows
+              </Text>
+            )}
+          </View>
+        )}
+      </ScrollView>
+    </ErrorBoundary>
   );
 }
 
@@ -584,6 +721,12 @@ const styles = StyleSheet.create({
   statusText: {
     fontSize: 16,
     fontWeight: '500',
+  },
+  retryText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginLeft: 8,
+    fontStyle: 'italic',
   },
   configText: {
     fontSize: 14,
